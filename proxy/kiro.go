@@ -400,7 +400,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			continue
 		}
 
-		err = parseEventStream(resp.Body, callback)
+		err = parseEventStream(newStallTimeoutReader(resp.Body, kiroStreamIdleTimeout), callback)
 		resp.Body.Close()
 		return err
 	}
@@ -409,6 +409,50 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		return lastErr
 	}
 	return fmt.Errorf("all endpoints failed")
+}
+
+// kiroStreamIdleTimeout bounds silence on the upstream event stream: a
+// connected-but-silent upstream used to hang clients for minutes until their
+// own timeout fired (production incident 2026-10-25, 5-minute stall).
+const kiroStreamIdleTimeout = 90 * time.Second
+
+// stallTimeoutReader aborts reads with an error when no data arrives within
+// the idle window. The watchdog re-arms on every successful read, so steadily
+// streaming responses are never interrupted — only true stalls are.
+type stallTimeoutReader struct {
+	r        io.Reader
+	idle     time.Duration
+	timer    *time.Timer
+	timedOut bool
+	mu       sync.Mutex
+}
+
+func newStallTimeoutReader(r io.Reader, idle time.Duration) *stallTimeoutReader {
+	sr := &stallTimeoutReader{r: r, idle: idle}
+	sr.timer = time.AfterFunc(idle, func() {
+		sr.mu.Lock()
+		sr.timedOut = true
+		sr.mu.Unlock()
+		// Unblock a pending Read blocked inside the underlying body.
+		if c, ok := r.(io.Closer); ok {
+			_ = c.Close()
+		}
+	})
+	return sr
+}
+
+func (sr *stallTimeoutReader) Read(p []byte) (int, error) {
+	sr.mu.Lock()
+	timedOut := sr.timedOut
+	sr.mu.Unlock()
+	if timedOut {
+		return 0, fmt.Errorf("upstream stalled: no data for %s", sr.idle)
+	}
+	n, err := sr.r.Read(p)
+	if n > 0 {
+		sr.timer.Reset(sr.idle)
+	}
+	return n, err
 }
 
 // ==================== Event Stream Parsing ====================
