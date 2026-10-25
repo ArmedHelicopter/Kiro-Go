@@ -323,21 +323,23 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	}
 
 	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" {
-		profileArn, err := ResolveProfileArn(account)
-		if err != nil {
+		if profileArn, err := ResolveProfileArn(account); err == nil {
+			payload.ProfileArn = profileArn
+		} else {
 			accountEmail := "<nil>"
 			if account != nil {
 				accountEmail = account.Email
 			}
-			// Fail hard instead of sending an ARN-less request: upstream
-			// rejects ARN-less payloads with INVALID_MODEL_ID (HTTP 400),
-			// which the account-failover classifier cannot recognize — so
-			// affinity-pinned sessions kept hitting the same broken account
-			// (production incident 2026-10-25). Returning the classifier-
-			// recognized error lets the caller rotate to a healthy account.
-			return fmt.Errorf("resolve profileArn for %s: %w", accountEmail, err)
+			// Builder ID accounts can never resolve a profile ARN
+			// (ListAvailableProfiles answers 403 "AWS Builder ID is not
+			// supported for this operation") and ARN-less requests are their
+			// normal, working operation — so log and proceed. Failing hard
+			// here took the whole proxy down for Builder ID pools
+			// (regression reverted 2026-10-25). The INVALID_MODEL_ID 400
+			// storms were caused by the since-removed view_image injection,
+			// not by missing ARNs.
+			logger.Warnf("[ProfileArn] Failed to resolve profile ARN for %s: %v", accountEmail, err)
 		}
-		payload.ProfileArn = profileArn
 	}
 
 	// Build endpoint list ordered by configuration.
