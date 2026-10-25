@@ -1,16 +1,164 @@
 package proxy
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"kiro-go/config"
+	"kiro-go/logger"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
+
+// historyImageOffloadOn gates archiving history images to disk. Enabled once
+// at server startup; unit tests that exercise the translators directly keep
+// the default off so they never touch the filesystem.
+var historyImageOffloadOn atomic.Bool
+
+// EnableHistoryImageOffload turns on archiving history images to disk.
+func EnableHistoryImageOffload() { historyImageOffloadOn.Store(true) }
+
+// disableHistoryImageOffload turns the archiving back off (test helper).
+func disableHistoryImageOffload() { historyImageOffloadOn.Store(false) }
+
+// imageOffloadDir returns the directory for archived history images.
+func imageOffloadDir() string {
+	if dir := os.Getenv("KIRO_IMAGE_OFFLOAD_DIR"); dir != "" {
+		return dir
+	}
+	return filepath.Join("data", "viewable-images")
+}
+
+// ==================== 当前轮图片内联预算 ====================
+// 设计（astra 评审 2026-10-25）：图片一律先归档；小图（≤512KB 且总量 ≤1MB）
+// 保留内联省一次工具往返；超大图归档并以 IMAGE_INDEX 文本引用替换，模型需要看时
+// 通过图片查看工具串行取图（每次上游请求只带一张），防止单请求爆上下文/断流。
+
+const (
+	imageInlineMaxBytes   = 512 * 1024  // 单图内联阈值
+	imageInlineTotalBytes = 1024 * 1024 // 单请求图片总内联预算
+)
+
+// applyCurrentImageBudget enforces the inline budget for the CURRENT message's
+// images: small images stay inline; oversized ones (or those exceeding the
+// per-request budget) are archived content-addressed and replaced by an
+// IMAGE_INDEX text block listing id/path/size so the model can view them
+// serially via its image-viewing tool. Unparseable images are conservatively
+// kept inline. Returns surviving inline images and the index text ("" if none
+// was archived).
+func applyCurrentImageBudget(images []KiroImage) ([]KiroImage, string) {
+	if len(images) == 0 {
+		return images, ""
+	}
+	dir := imageOffloadDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return images, ""
+	}
+	kept := images[:0:0]
+	total := 0
+	var index strings.Builder
+	for _, img := range images {
+		raw, err := base64.StdEncoding.DecodeString(img.Source.Bytes)
+		if err != nil || len(raw) == 0 {
+			kept = append(kept, img) // unparseable: keep inline (upstream will complain if truly broken)
+			continue
+		}
+		size := len(raw)
+		if size <= imageInlineMaxBytes && total+size <= imageInlineTotalBytes {
+			kept = append(kept, img)
+			total += size
+			continue
+		}
+		path, id, err := archiveKiroImage(img, dir)
+		if err != nil || path == "" {
+			kept = append(kept, img) // archival failed: keep inline rather than drop
+			continue
+		}
+		archived := size
+		fmt.Fprintf(&index, "[IMAGE_INDEX]\n- id: %s\n  size: %d bytes\n  format: %s\n  summary: not inspected; to inspect it, call the view_image tool with this exact id\n[/IMAGE_INDEX]\n", id, archived, img.Format)
+	}
+	return kept, index.String()
+}
+
+// offloadHistoryImages archives every image embedded in history turns to disk
+// and replaces it with a text reference. History replays stop carrying
+// megabytes of base64 (the #1 cause of payload bloat and image loss), while
+// the model can still view any archived image through its image-viewing tool
+// (e.g. the client's read_image) by path. Current-message images are kept
+// inline. Images whose archival fails are KEPT inline (never silently dropped)
+// and the failure is logged. Returns the number of images archived.
+func offloadHistoryImages(payload *KiroPayload) int {
+	if payload == nil || !historyImageOffloadOn.Load() {
+		return 0
+	}
+	dir := imageOffloadDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		logger.Warnf("[ImageOffload] cannot create offload dir %s: %v — keeping history images inline", dir, err)
+		return 0
+	}
+	count := 0
+	for i := range payload.ConversationState.History {
+		m := &payload.ConversationState.History[i]
+		if m.UserInputMessage == nil || len(m.UserInputMessage.Images) == 0 {
+			continue
+		}
+		kept := m.UserInputMessage.Images[:0:0]
+		for _, img := range m.UserInputMessage.Images {
+			_, id, err := archiveKiroImage(img, dir)
+			if err != nil || id == "" {
+				// Archival failed (decode/disk/permission): keep the original
+				// image inline. Never silently drop user data.
+				kept = append(kept, img)
+				logger.Warnf("[ImageOffload] archive failed, keeping image inline: %v", err)
+				continue
+			}
+			m.UserInputMessage.Content += "\n\n[image archived: " + id + " — to inspect it, call the view_image tool with this exact id]"
+			count++
+		}
+		m.UserInputMessage.Images = kept
+	}
+	return count
+}
+
+// archiveKiroImage decodes a base64 image, stores it content-addressed, and
+// returns the file path. Identical images across turns dedupe to one file.
+// The extension is whitelisted: img.Format is client-controlled and an unchecked
+// extension could escape the offload directory via path traversal.
+func archiveKiroImage(img KiroImage, dir string) (string, string, error) {
+	raw, err := base64.StdEncoding.DecodeString(img.Source.Bytes)
+	if err != nil || len(raw) == 0 {
+		return "", "", err
+	}
+	sum := sha256.Sum256(raw)
+	id := "img_" + hex.EncodeToString(sum[:])
+	ext := strings.ToLower(strings.TrimSpace(img.Format))
+	switch ext {
+	case "png", "jpeg", "jpg", "gif", "webp":
+		if ext == "jpg" {
+			ext = "jpeg"
+		}
+	default:
+		ext = "png"
+	}
+	name := hex.EncodeToString(sum[:]) + "." + ext
+	path := filepath.Join(dir, name)
+	if _, err := os.Stat(path); err == nil {
+		return path, id, nil
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		return "", "", err
+	}
+	return path, id, nil
+}
 
 // modelAliases lists model names that need an explicit redirect — dated snapshots,
 // cross-family legacy IDs (claude-3-*), and non-Anthropic fallbacks.
@@ -42,7 +190,15 @@ var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
 
-const minimalFallbackUserContent = "."
+// minimalFallbackUserContent replaces an empty user message (Kiro 400s on empty
+// content). A bare "." was used before, but replayed across a long history it
+// taught the model to imitate "." replies and made it misread those turns as
+// contentless. Use a self-describing placeholder instead.
+const minimalFallbackUserContent = "[No new user text this turn — automated continuation. Continue the active goal/work from the conversation history without asking the user.]"
+
+// historyEmptyTurnText backfills HISTORY user turns whose content was lost
+// (e.g. an image was offloaded by the client before resend).
+const historyEmptyTurnText = "[This turn's media/attachment was dropped from the replayed history due to payload limits; its text was empty.]"
 const toolResultsContinuationPrefix = "Tool results:"
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
 
@@ -130,6 +286,14 @@ type ClaudeRequest struct {
 	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
 	Tools       []ClaudeTool          `json:"tools,omitempty"`
 	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+	Metadata    *ClaudeMetadata       `json:"metadata,omitempty"`
+}
+
+// ClaudeMetadata carries the client's session identity (Claude Code sends
+// user_<hash>_account__session_<uuid> here). Used only for local account
+// affinity; never forwarded upstream.
+type ClaudeMetadata struct {
+	UserID string `json:"user_id,omitempty"`
 }
 
 type ClaudeThinkingConfig struct {
@@ -214,7 +378,9 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 		if msg.Role == "user" {
 			content, images, toolResults := extractClaudeUserContent(msg.Content)
-			content = normalizeUserContent(content, len(images) > 0)
+			// 保留原始文本（仅 TrimSpace）：图片占位文本延迟到最终消息构建阶段
+			// 统一生成，避免"图片存在"提前盖掉工具结果文本（见 buildCurrentMessageContent）。
+			content = strings.TrimSpace(content)
 
 			if isLast {
 				currentContent = content
@@ -285,16 +451,14 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		history = sanitizeKiroHistory(history, nil)
 	}
 
-	// 构建最终内容
-	finalContent := ""
-	if currentContent != "" {
-		finalContent = currentContent
-	} else if len(currentImages) > 0 {
-		finalContent = normalizeUserContent("", true)
-	} else if len(currentToolResults) > 0 {
-		finalContent = buildToolResultsContinuation(currentToolResults)
-	} else {
-		finalContent = minimalFallbackUserContent
+	// 构建最终内容（决策表见 buildCurrentMessageContent）：
+	// 用户文本 > 工具结果续写 > 图片提示 > 兜底；孤儿工具结果拼回文本不丢弃；
+	// 图片始终作为 currentMessage.Images 附着，与文本共存。
+	// 当前轮图片先过内联预算：超大图归档并以 IMAGE_INDEX 引用替换。
+	currentImages, imageIndexNote := applyCurrentImageBudget(currentImages)
+	finalContent := buildCurrentMessageContent(currentContent, currentToolResults, len(currentImages) > 0, keepCurrentToolResults)
+	if imageIndexNote != "" {
+		finalContent += "\n\n" + imageIndexNote
 	}
 
 	// 转换工具
@@ -339,6 +503,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		}
 	}
 
+	offloadHistoryImages(payload)
 	truncatePayloadToLimit(payload, systemPrompt != "")
 
 	return payload
@@ -977,13 +1142,15 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 // ==================== OpenAI API 类型 ====================
 
 type OpenAIRequest struct {
-	Model       string          `json:"model"`
-	Messages    []OpenAIMessage `json:"messages"`
-	MaxTokens   int             `json:"max_tokens,omitempty"`
-	Temperature float64         `json:"temperature,omitempty"`
-	TopP        float64         `json:"top_p,omitempty"`
-	Stream      bool            `json:"stream,omitempty"`
-	Tools       []OpenAITool    `json:"tools,omitempty"`
+	Model          string          `json:"model"`
+	Messages       []OpenAIMessage `json:"messages"`
+	MaxTokens      int             `json:"max_tokens,omitempty"`
+	Temperature    float64         `json:"temperature,omitempty"`
+	TopP           float64         `json:"top_p,omitempty"`
+	Stream         bool            `json:"stream,omitempty"`
+	Tools          []OpenAITool    `json:"tools,omitempty"`
+	PromptCacheKey string          `json:"prompt_cache_key,omitempty"`
+	User           string          `json:"user,omitempty"`
 }
 
 type OpenAIMessage struct {
@@ -1075,9 +1242,17 @@ type OpenAIChoice struct {
 }
 
 type OpenAIUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens        int                        `json:"prompt_tokens"`
+	CompletionTokens    int                        `json:"completion_tokens"`
+	TotalTokens         int                        `json:"total_tokens"`
+	PromptTokensDetails *OpenAIPromptTokensDetails `json:"prompt_tokens_details,omitempty"`
+}
+
+// OpenAIPromptTokensDetails reports how many prompt tokens were served from
+// the upstream prefix cache, so clients (EasyCLIProxy / DSH) can show real
+// cache hit rates instead of zero.
+type OpenAIPromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
 }
 
 // ==================== OpenAI -> Kiro 转换 ====================
@@ -1117,7 +1292,8 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		switch msg.Role {
 		case "user":
 			content, images := extractOpenAIUserContent(msg.Content)
-			content = normalizeUserContent(content, len(images) > 0)
+			// 保留原始文本：图片占位延迟到最终构建阶段（与 Claude 路径一致）
+			content = strings.TrimSpace(content)
 
 			if isLast {
 				currentContent = content
@@ -1230,16 +1406,12 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		history = sanitizeKiroHistory(history, nil)
 	}
 
-	// 构建最终内容
-	finalContent := currentContent
-	if finalContent == "" {
-		if len(currentImages) > 0 {
-			finalContent = normalizeUserContent("", true)
-		} else if len(currentToolResults) > 0 {
-			finalContent = buildToolResultsContinuation(currentToolResults)
-		} else {
-			finalContent = minimalFallbackUserContent
-		}
+	// 构建最终内容（决策表见 buildCurrentMessageContent；与 Claude 路径共用）。
+	// 注意：当前消息图片先过内联预算（超大图归档+IMAGE_INDEX 引用替换）。
+	currentImages, imageIndexNote := applyCurrentImageBudget(currentImages)
+	finalContent := buildCurrentMessageContent(currentContent, currentToolResults, len(currentImages) > 0, keepCurrentToolResults)
+	if imageIndexNote != "" {
+		finalContent += "\n\n" + imageIndexNote
 	}
 
 	// 转换工具
@@ -1279,6 +1451,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 
+	offloadHistoryImages(payload)
 	truncatePayloadToLimit(payload, systemPrompt != "")
 
 	return payload
@@ -1570,7 +1743,7 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 		// dozens of "." assistant turns, which the model then imitates by
 		// replying ".". Mark such turns for removal instead.
 		if msg.UserInputMessage != nil && strings.TrimSpace(msg.UserInputMessage.Content) == "" && len(msg.UserInputMessage.Images) == 0 {
-			msg.UserInputMessage.Content = minimalFallbackUserContent
+			msg.UserInputMessage.Content = historyEmptyTurnText
 		}
 	}
 
@@ -1585,8 +1758,8 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 		msg := history[i]
 		if msg.AssistantResponseMessage != nil && len(msg.AssistantResponseMessage.ToolUses) == 0 {
 			c := strings.TrimSpace(msg.AssistantResponseMessage.Content)
-			if c == "" || c == minimalFallbackUserContent {
-				continue // drop hollow assistant turn
+			if c == "" || c == "." || c == minimalFallbackUserContent || c == historyEmptyTurnText {
+				continue // drop hollow assistant turn (incl. legacy "." replays)
 			}
 		}
 		// Collapse runs of consecutive identical user "Tool results" turns. A
@@ -1625,7 +1798,9 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	if payload == nil {
 		return
 	}
-	if payloadByteSize(payload) <= maxPayloadBytes {
+	// 只护栏文本字节：图片 base64 与 token 计量严重非线性（~750B/token），
+	// 计入会让任何带图请求误触发截断并销毁当前消息文本。
+	if payloadTextByteSize(payload) <= maxPayloadBytes {
 		return
 	}
 
@@ -1650,15 +1825,25 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 		},
 	}
 
-	// Precompute byte size of each conversation entry once (O(n)).
+	// Precompute byte size of each conversation entry once (O(n)). Text bytes
+	// only: image base64 is excluded from the guard (see payloadTextByteSize).
 	entrySizes := make([]int, len(conversation))
 	for i := range conversation {
-		entrySizes[i] = historyEntryByteSize(conversation[i])
+		sz := historyEntryByteSize(conversation[i])
+		if m := conversation[i].UserInputMessage; m != nil {
+			for _, img := range m.Images {
+				sz -= len(img.Source.Bytes) + 48
+			}
+		}
+		if sz < 1 {
+			sz = 1
+		}
+		entrySizes[i] = sz
 	}
 
 	// Base size: payload with priming only (no conversation), plus placeholder.
 	payload.ConversationState.History = priming
-	baseSize := payloadByteSize(payload) + historyEntryByteSize(placeholderEntry)
+	baseSize := payloadTextByteSize(payload) + historyEntryByteSize(placeholderEntry)
 
 	// Keep the largest suffix of the conversation that fits, but never fewer than
 	// minRecentHistoryTurns entries (so recent context is preserved).
@@ -1684,9 +1869,9 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	rebuilt = append(rebuilt, tail...)
 	payload.ConversationState.History = rebuilt
 
-	// If still too large (current message or retained tail alone exceeds the
-	// limit), shrink the current message content as a last resort.
-	if payloadByteSize(payload) > maxPayloadBytes {
+	// If still too large (the retained text alone exceeds the limit), shrink the
+	// current message text as a last resort. Image bytes do not count.
+	if payloadTextByteSize(payload) > maxPayloadBytes {
 		truncateCurrentMessage(payload)
 	}
 }
@@ -1719,22 +1904,58 @@ func payloadByteSize(payload *KiroPayload) int {
 	return len(raw)
 }
 
+// imageBytesInPayload sums the base64 length of every image embedded in the
+// payload (history + current message). Images cost ~750 wire bytes per visual
+// token vs ~4.5 for text, so counting them against the byte guard — whose
+// purpose is to proxy the upstream TOKEN window — would false-trigger on any
+// image-bearing request and destroy the user's text via truncateCurrentMessage.
+func imageBytesInPayload(payload *KiroPayload) int {
+	if payload == nil {
+		return 0
+	}
+	total := 0
+	count := func(imgs []KiroImage) {
+		for _, img := range imgs {
+			total += len(img.Source.Bytes) + 48 // base64 + JSON field overhead
+		}
+	}
+	for i := range payload.ConversationState.History {
+		if m := payload.ConversationState.History[i].UserInputMessage; m != nil {
+			count(m.Images)
+		}
+	}
+	count(payload.ConversationState.CurrentMessage.UserInputMessage.Images)
+	return total
+}
+
+// payloadTextByteSize returns the serialized payload size excluding image
+// base64 bytes — the quantity the maxPayloadBytes guard actually protects.
+func payloadTextByteSize(payload *KiroPayload) int {
+	return payloadByteSize(payload) - imageBytesInPayload(payload)
+}
+
 func currentMessageModelID(payload *KiroPayload) string {
 	return payload.ConversationState.CurrentMessage.UserInputMessage.ModelID
 }
 
 // truncateCurrentMessage hard-truncates the current message content as a last
 // resort when even the minimal retained history plus current message exceeds the
-// limit.
+// limit. Image base64 bytes are excluded from the budget: a large attached
+// image must never destroy the user's typed text.
 func truncateCurrentMessage(payload *KiroPayload) {
 	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
-	overhead := payloadByteSize(payload) - len(cur.Content)
+	overhead := payloadTextByteSize(payload) - len(cur.Content)
 	budget := maxPayloadBytes - overhead
 	if budget < 0 {
 		budget = 0
 	}
 	if len(cur.Content) > budget {
-		if budget == 0 {
+		// Trim back to a rune boundary: slicing mid-rune would emit invalid
+		// UTF-8 for multi-byte content (e.g. Chinese) and upstream 400s on it.
+		for budget > 0 && !utf8.RuneStart(cur.Content[budget]) {
+			budget--
+		}
+		if budget <= 0 {
 			cur.Content = minimalFallbackUserContent
 			return
 		}
@@ -1765,9 +1986,48 @@ func buildToolResultsContinuation(toolResults []KiroToolResult) string {
 
 	joined := toolResultsContinuationPrefix + "\n\n" + strings.Join(parts, "\n\n")
 	if len(joined) > 4000 {
-		return joined[:4000]
+		// 按 rune 边界截断：字节切片会切碎多字节字符产生非法 UTF-8。
+		budget := 4000
+		for budget > 0 && !utf8.RuneStart(joined[budget]) {
+			budget--
+		}
+		return joined[:budget]
 	}
 	return joined
+}
+
+// buildCurrentMessageContent assembles the final current-message text from the
+// three optional sources. Decision table (design consult 2026-10-25, astra):
+//
+//	C = real user text, T = tool results, I = images
+//	C≠"", T structural → C                    (results ride structurally)
+//	C≠"", T orphan     → C + "\n\n" + cont(T) (orphan output is never dropped)
+//	C=="", T any       → cont(T)              (results are the turn's payload)
+//	C=="", no T, I     → image analysis note
+//	nothing at all     → minimalFallbackUserContent
+//
+// Images are always attached separately (currentMessage.Images) — never baked
+// into content, and never allowed to evict tool-result text (the bug that
+// produced a history full of "." turns the model then imitated).
+func buildCurrentMessageContent(currentContent string, currentToolResults []KiroToolResult, hasImages, resultsStructural bool) string {
+	if currentContent != "" {
+		if resultsStructural || len(currentToolResults) == 0 {
+			return currentContent
+		}
+		// Orphan tool results (no matching assistant toolUses): append their
+		// continuation so the output survives the non-structural downgrade.
+		if cont := buildToolResultsContinuation(currentToolResults); cont != "" {
+			return currentContent + "\n\n" + cont
+		}
+		return currentContent
+	}
+	if len(currentToolResults) > 0 {
+		return buildToolResultsContinuation(currentToolResults)
+	}
+	if hasImages {
+		return normalizeUserContent("", true)
+	}
+	return minimalFallbackUserContent
 }
 
 func trimLeadingAssistantHistory(history []KiroHistoryMessage) []KiroHistoryMessage {
@@ -2146,5 +2406,163 @@ func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUse
 			"completion_tokens": outputTokens,
 			"total_tokens":      inputTokens + outputTokens,
 		},
+	}
+}
+
+// ==================== 会话键（本地账号粘连用，不转发上游）====================
+
+// sessionUUIDPattern extracts the per-conversation UUID that Claude Code embeds
+// in metadata.user_id ("user_<hash>_account__session_<uuid>").
+var sessionUUIDPattern = regexp.MustCompile(`session_([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})`)
+
+// normalizeSessionKey bounds client-controlled session identities to a fixed
+// 32-hex-char hash and mixes in the API-key namespace, so a hostile client
+// cannot balloon the affinity map with unbounded keys and two tenants that
+// happen to send the same user/cache key cannot share or preempt bindings.
+func normalizeSessionKey(apiKeyID, prefix, raw string) string {
+	if raw == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(apiKeyID + "\x00" + prefix + ":" + raw))
+	return prefix + ":" + hex.EncodeToString(sum[:16])
+}
+
+// claudeSessionKey derives a stable per-conversation key used for account
+// affinity: the same conversation keeps hitting the same Kiro account, so the
+// upstream prefix cache can hit. Falls back to a fingerprint of
+// model + system + first user message when the client sends no identity.
+func claudeSessionKey(req *ClaudeRequest, apiKeyID string) string {
+	if req == nil {
+		return ""
+	}
+	if req.Metadata != nil {
+		if uid := strings.TrimSpace(req.Metadata.UserID); uid != "" {
+			if m := sessionUUIDPattern.FindStringSubmatch(uid); m != nil {
+				return normalizeSessionKey(apiKeyID, "claude", strings.ToLower(m[1]))
+			}
+			return normalizeSessionKey(apiKeyID, "claude", uid)
+		}
+	}
+	return claudeFingerprint(req, apiKeyID)
+}
+
+func claudeFingerprint(req *ClaudeRequest, apiKeyID string) string {
+	system := claudeSystemText(req.System)
+	first := ""
+	firstRaw := interface{}(nil)
+	for _, msg := range req.Messages {
+		if msg.Role == "user" {
+			first = claudeContentText(msg.Content)
+			firstRaw = msg.Content
+			break
+		}
+	}
+	if system == "" && first == "" {
+		// Image-only or otherwise non-text first turn: hash the raw content so
+		// media-bearing conversations still get a stable affinity key.
+		if firstRaw != nil {
+			ch := sha256.Sum256([]byte(canonicalizeCacheValue(firstRaw)))
+			return normalizeSessionKey(apiKeyID, "claude-img", hex.EncodeToString(ch[:]))
+		}
+		return ""
+	}
+	sum := sha256.Sum256([]byte(req.Model + "\x00" + system + "\x00" + first))
+	return normalizeSessionKey(apiKeyID, "claude-fp", hex.EncodeToString(sum[:]))
+}
+
+func claudeSystemText(v interface{}) string {
+	switch s := v.(type) {
+	case string:
+		return s
+	case []interface{}:
+		var b strings.Builder
+		for _, raw := range s {
+			if m, ok := raw.(map[string]interface{}); ok {
+				if t, ok := m["text"].(string); ok {
+					b.WriteString(t)
+				}
+			}
+		}
+		return b.String()
+	default:
+		return ""
+	}
+}
+
+func claudeContentText(content interface{}) string {
+	switch c := content.(type) {
+	case string:
+		return c
+	case []interface{}:
+		var b strings.Builder
+		for _, raw := range c {
+			if m, ok := raw.(map[string]interface{}); ok {
+				if m["type"] == "text" {
+					if t, ok := m["text"].(string); ok {
+						b.WriteString(t)
+					}
+				}
+			}
+		}
+		return b.String()
+	default:
+		return ""
+	}
+}
+
+// openAISessionKey mirrors claudeSessionKey for the OpenAI protocol:
+// prompt_cache_key / user when present, else a content fingerprint (with an
+// image-content fallback for media-only first turns).
+func openAISessionKey(req *OpenAIRequest, apiKeyID string) string {
+	if req == nil {
+		return ""
+	}
+	if k := strings.TrimSpace(req.PromptCacheKey); k != "" {
+		return normalizeSessionKey(apiKeyID, "openai", k)
+	}
+	if u := strings.TrimSpace(req.User); u != "" {
+		return normalizeSessionKey(apiKeyID, "openai", u)
+	}
+	var system, first string
+	firstRaw := interface{}(nil)
+	for _, msg := range req.Messages {
+		switch msg.Role {
+		case "system", "developer":
+			system += openAIContentText(msg.Content)
+		case "user":
+			if first == "" {
+				first = openAIContentText(msg.Content)
+				firstRaw = msg.Content
+			}
+		}
+	}
+	if system == "" && first == "" {
+		// Image-only or otherwise non-text first turn.
+		if firstRaw != nil {
+			ch := sha256.Sum256([]byte(canonicalizeCacheValue(firstRaw)))
+			return normalizeSessionKey(apiKeyID, "openai-img", hex.EncodeToString(ch[:]))
+		}
+		return ""
+	}
+	sum := sha256.Sum256([]byte(req.Model + "\x00" + system + "\x00" + first))
+	return normalizeSessionKey(apiKeyID, "openai-fp", hex.EncodeToString(sum[:]))
+}
+
+func openAIContentText(content interface{}) string {
+	switch c := content.(type) {
+	case string:
+		return c
+	case []interface{}:
+		var b strings.Builder
+		for _, raw := range c {
+			if m, ok := raw.(map[string]interface{}); ok {
+				if t, ok := m["text"].(string); ok {
+					b.WriteString(t)
+				}
+			}
+		}
+		return b.String()
+	default:
+		return ""
 	}
 }

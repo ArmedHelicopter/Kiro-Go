@@ -554,12 +554,15 @@ func TestClaudeToolResultMixedTextAndImage(t *testing.T) {
 	if len(cur.Images) != 1 {
 		t.Fatalf("expected one image extracted, got %d", len(cur.Images))
 	}
-	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
-		t.Fatalf("expected one tool result")
+	// The tool result arrives with NO prior assistant tool_use in this request,
+	// so it cannot be attached structurally (Kiro 400s on orphan tool results).
+	// ClaudeToKiro's documented behavior: flatten the text into the current
+	// message and keep the image on the current message.
+	if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.ToolResults) > 0 {
+		t.Fatalf("orphan tool result should be flattened, not attached structurally")
 	}
-	gotText := cur.UserInputMessageContext.ToolResults[0].Content[0].Text
-	if gotText != "here is the screenshot" {
-		t.Fatalf("expected original tool text preserved, got %q", gotText)
+	if !strings.Contains(cur.Content, "here is the screenshot") {
+		t.Fatalf("expected flattened tool text preserved in current content, got %q", cur.Content)
 	}
 }
 
@@ -624,10 +627,12 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 
 	payload := OpenAIToKiro(req, false)
 
+	// sanitizeKiroHistory narrates structured ToolResults on flushed history
+	// entries into text and then nils the context, so count the archived image
+	// on the tool-result turn directly rather than via the (nil) context.
 	var toolHistImages int
 	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil && h.UserInputMessage.UserInputMessageContext != nil &&
-			len(h.UserInputMessage.UserInputMessageContext.ToolResults) > 0 {
+		if h.UserInputMessage != nil && len(h.UserInputMessage.Images) > 0 {
 			toolHistImages += len(h.UserInputMessage.Images)
 		}
 	}

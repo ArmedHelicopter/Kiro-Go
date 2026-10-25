@@ -112,6 +112,24 @@ curl http://localhost:8080/v1/chat/completions \
 |-----|------|-------|
 | `CONFIG_PATH` | 配置文件路径 | `data/config.json` |
 | `ADMIN_PASSWORD` | 管理面板密码（覆盖配置文件） | - |
+| `KIRO_IMAGE_OFFLOAD_DIR` | 会话图片归档目录 | `data/viewable-images` |
+
+## 图片处理
+
+会话中的大图会归档到本地内容寻址库，不再随每次上游请求重放：
+
+- 历史图片与超过内联预算的当前轮图片（单图 > 512KB，或单请求图片总量
+  > 1MB）写入 `data/viewable-images/<sha256>.<ext>`，按内容哈希去重。
+- 模型只会看到 `[IMAGE_INDEX]` 中的不透明 id（`img_<sha256>`），
+  不向模型暴露任何文件系统路径。
+- 模型可携带 id 调用代理内部工具 `view_image` 查看归档图；代理以独立小请求
+  执行（每个客户端请求最多 3 张图、4 轮，输出截断至 4000 字符并以不可信数据
+  标注回灌）。`view_image` 为代理自有工具，绝不转发给客户端。
+- 归档失败的图片保留内联（绝不静默丢弃）。
+- 归档、预算与精确 id 匹配均有单元测试覆盖（`proxy/image_offload_test.go`）。
+
+缓存用量回报：OpenAI 响应包含 `prompt_tokens_details.cached_tokens`，
+Claude 响应包含缓存读/写 token，客户端可直观看到真实缓存命中率。
 
 ## 参与贡献
 

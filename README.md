@@ -112,6 +112,30 @@ The setting takes effect immediately without restarting.
 |----------|-------------|---------|
 | `CONFIG_PATH` | Config file path | `data/config.json` |
 | `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
+| `KIRO_IMAGE_OFFLOAD_DIR` | Directory for archived conversation images | `data/viewable-images` |
+
+## Image Handling
+
+Large conversation images are archived to a local content-addressed store
+instead of being replayed in every upstream request:
+
+- History images and oversized current-turn images (single image > 512 KB or
+  more than 1 MB per request) are stored under `data/viewable-images/` as
+  `<sha256>.<ext>`, deduplicated by content hash.
+- The model sees an `[IMAGE_INDEX]` block with opaque ids (`img_<sha256>`) —
+  no filesystem paths are exposed to the model.
+- The model can inspect an archived image by calling the internal `view_image`
+  tool with the id; the proxy runs a small side request (max 3 images and
+  4 rounds per client request, output capped at 4000 characters and returned
+  as untrusted data). `view_image` is proxy-internal and never forwarded to
+  the client.
+- Images whose archival fails stay inline (never silently dropped).
+- Archiving failure handling, budgets, and the exact-id lookup are covered by
+  unit tests in `proxy/image_offload_test.go`.
+
+Cache usage reporting: OpenAI responses include
+`prompt_tokens_details.cached_tokens`, and Claude responses include cache
+read/creation tokens, so clients can see real cache hit rates.
 
 ## Contributing
 

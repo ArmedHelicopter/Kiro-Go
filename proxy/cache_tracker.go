@@ -37,6 +37,8 @@ type promptCacheProfile struct {
 	Breakpoints      []promptCacheBreakpoint
 	TotalInputTokens int
 	Model            string
+	// MinTokens overrides the per-model cacheable threshold (0 = default).
+	MinTokens        int
 }
 
 func minCacheableTokensForModel(model string) int {
@@ -125,14 +127,128 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 	}
 }
 
+// BuildOpenAIProfile mirrors BuildClaudeProfile for OpenAI-protocol requests.
+// OpenAI auto-caches prefixes (>=1024 tokens), so every message end acts as an
+// implicit 5-minute breakpoint without requiring client cache_control blocks.
+// Kiro upstream caches by account + stable prefix, so this estimates the
+// same hit/creation split the upstream billing already applies.
+func (t *promptCacheTracker) BuildOpenAIProfile(req *OpenAIRequest, totalInputTokens int) *promptCacheProfile {
+	if req == nil {
+		return nil
+	}
+
+	blocks := make([]cacheablePromptBlock, 0, len(req.Messages)+1)
+	blocks = append(blocks, cacheablePromptBlock{
+		Value: map[string]interface{}{
+			"kind":  "request_prelude",
+			"model": req.Model,
+		},
+		Tokens: 4,
+	})
+
+	// Tool definitions are part of the cached prefix (they dominate real agent
+	// traffic: 5-7K tokens of tool schemas vs a few hundred of messages).
+	for ti, tool := range req.Tools {
+		value := map[string]interface{}{
+			"kind":         "tool",
+			"tool_index":  ti,
+			"name":        tool.Function.Name,
+			"description": tool.Function.Description,
+			"parameters":  tool.Function.Parameters,
+		}
+		blocks = append(blocks, cacheablePromptBlock{
+			Value:  value,
+			Tokens: estimateApproxTokens(canonicalizeCacheValue(value)),
+		})
+	}
+
+	for i, msg := range req.Messages {
+		value := map[string]interface{}{
+			"kind":    "message",
+			"index":   i,
+			"role":    msg.Role,
+			"content": openAIContentText(msg.Content),
+		}
+		if len(msg.ToolCalls) > 0 {
+			calls := make([]string, 0, len(msg.ToolCalls))
+			for _, tc := range msg.ToolCalls {
+				calls = append(calls, tc.Function.Name+"\x00"+tc.Function.Arguments)
+			}
+			value["tool_calls"] = calls
+		}
+		blocks = append(blocks, cacheablePromptBlock{
+			Value:        value,
+			Tokens:       estimateApproxTokens(canonicalizeCacheValue(value)),
+			IsMessageEnd: true,
+			TTL:          defaultPromptCacheTTL,
+		})
+	}
+
+	// Block token estimates are FIXED (raw canonical-JSON estimates, no
+	// rescaling): rescaling per request would give the same stored prefix
+	// fingerprint different CumulativeTokens on different turns, so Compute
+	// would report drifting/inflated cached_tokens. The fixed scale is
+	// internally consistent; handlers may rescale once at reporting time using
+	// the real input-token count. totalInputTokens is still recorded (floored
+	// at the block total) so Compute's percentage cap has a sane base.
+
+	hasher := sha256.New()
+	breakpoints := make([]promptCacheBreakpoint, 0)
+	cumulativeTokens := 0
+
+	for _, block := range blocks {
+		writeHashChunk(hasher, canonicalizeCacheValue(block.Value))
+		cumulativeTokens += block.Tokens
+		if !block.IsMessageEnd || block.TTL <= 0 {
+			continue
+		}
+		var fingerprint [32]byte
+		copy(fingerprint[:], hasher.Sum(nil))
+		breakpoints = append(breakpoints, promptCacheBreakpoint{
+			Fingerprint:      fingerprint,
+			CumulativeTokens: cumulativeTokens,
+			TTL:              block.TTL,
+		})
+	}
+
+	if len(breakpoints) == 0 {
+		return nil
+	}
+
+	if totalInputTokens < cumulativeTokens {
+		totalInputTokens = cumulativeTokens
+	}
+
+	return &promptCacheProfile{
+		Breakpoints:      breakpoints,
+		TotalInputTokens: totalInputTokens,
+		Model:            req.Model,
+		// OpenAI fingerprint blocks cover only client-sent content (the upstream adds
+		// its own hidden context), so the threshold filters noise on the small local
+		// estimate rather than on upstream-billed tokens.
+		MinTokens:        64,
+	}
+}
+
 func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfile) promptCacheUsage {
 	if t == nil || profile == nil || len(profile.Breakpoints) == 0 || accountID == "" {
 		return promptCacheUsage{}
 	}
 
-	minTokens := minCacheableTokensForModel(profile.Model)
+	minTokens := profile.MinTokens
+	if minTokens <= 0 {
+		minTokens = minCacheableTokensForModel(profile.Model)
+	}
 	last := profile.Breakpoints[len(profile.Breakpoints)-1]
 	lastTokens := minInt(last.CumulativeTokens, profile.TotalInputTokens)
+
+	// Cap cacheable tokens at 85% of total input — applied identically to
+	// creation (first request) and reads so both paths share one reporting
+	// convention. The newest content in a request is never fully cached.
+	maxCacheable := int(float64(profile.TotalInputTokens) * 0.85)
+	if lastTokens > maxCacheable {
+		lastTokens = maxCacheable
+	}
 	now := time.Now()
 
 	t.mu.Lock()
@@ -153,14 +269,6 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 			CacheCreation5mInputTokens: cache5m,
 			CacheCreation1hInputTokens: cache1h,
 		}
-	}
-
-	// Cap cacheable tokens at 85% of total input to ensure a realistic
-	// uncached portion. The newest content in a request is never fully
-	// served from cache on the current turn.
-	maxCacheable := int(float64(profile.TotalInputTokens) * 0.85)
-	if lastTokens > maxCacheable {
-		lastTokens = maxCacheable
 	}
 
 	matchedTokens := 0
@@ -198,7 +306,10 @@ func (t *promptCacheTracker) Update(accountID string, profile *promptCacheProfil
 		return
 	}
 
-	minTokens := minCacheableTokensForModel(profile.Model)
+	minTokens := profile.MinTokens
+	if minTokens <= 0 {
+		minTokens = minCacheableTokensForModel(profile.Model)
+	}
 	now := time.Now()
 	t.mu.Lock()
 	defer t.mu.Unlock()
