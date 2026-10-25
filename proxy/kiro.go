@@ -323,15 +323,21 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	}
 
 	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" {
-		if profileArn, err := ResolveProfileArn(account); err == nil {
-			payload.ProfileArn = profileArn
-		} else {
+		profileArn, err := ResolveProfileArn(account)
+		if err != nil {
 			accountEmail := "<nil>"
 			if account != nil {
 				accountEmail = account.Email
 			}
-			logger.Warnf("[ProfileArn] Failed to resolve profile ARN for %s: %v", accountEmail, err)
+			// Fail hard instead of sending an ARN-less request: upstream
+			// rejects ARN-less payloads with INVALID_MODEL_ID (HTTP 400),
+			// which the account-failover classifier cannot recognize — so
+			// affinity-pinned sessions kept hitting the same broken account
+			// (production incident 2026-10-25). Returning the classifier-
+			// recognized error lets the caller rotate to a healthy account.
+			return fmt.Errorf("resolve profileArn for %s: %w", accountEmail, err)
 		}
+		payload.ProfileArn = profileArn
 	}
 
 	// Build endpoint list ordered by configuration.
