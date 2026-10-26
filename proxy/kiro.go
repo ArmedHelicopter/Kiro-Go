@@ -4,6 +4,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -374,8 +375,17 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 		req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
 
+		// Header-phase deadline: a hung upstream (e.g. an oversized payload that
+		// stalls without ever sending response headers) must fail fast enough
+		// for endpoint/account rotation instead of blocking for minutes. The
+		// stream body itself is bounded by the stall watchdog below.
+		reqCtx, reqCancel := context.WithCancel(req.Context())
+		headerTimer := time.AfterFunc(kiroUpstreamHeadersTimeout, reqCancel)
+		req = req.WithContext(reqCtx)
 		resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
+		headerTimer.Stop()
 		if err != nil {
+			reqCancel()
 			lastErr = err
 			logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
 			continue
@@ -383,6 +393,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 
 		if resp.StatusCode == 429 {
 			resp.Body.Close()
+			reqCancel()
 			logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
 			lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
 			continue
@@ -391,6 +402,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		if resp.StatusCode != 200 {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			reqCancel()
 			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
 			// Authentication errors and payment errors are not retried across endpoints.
 			if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
@@ -402,6 +414,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 
 		err = parseEventStream(newStallTimeoutReader(resp.Body, kiroStreamIdleTimeout), callback)
 		resp.Body.Close()
+		reqCancel()
 		return err
 	}
 
@@ -410,6 +423,12 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	}
 	return fmt.Errorf("all endpoints failed")
 }
+
+// kiroUpstreamHeadersTimeout bounds how long the upstream may take to send
+// response headers. Oversized payloads can make Kiro stall before any byte
+// arrives; without this deadline such requests hang for minutes and the
+// client timeouts surface as opaque 5xx errors.
+const kiroUpstreamHeadersTimeout = 180 * time.Second
 
 // kiroStreamIdleTimeout bounds silence on the upstream event stream: a
 // connected-but-silent upstream used to hang clients for minutes until their
