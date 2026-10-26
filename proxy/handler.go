@@ -540,7 +540,7 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 		"output": []string{"text"},
 	}
 
-	return map[string]interface{}{
+	entry := map[string]interface{}{
 		"id":               id,
 		"object":           "model",
 		"owned_by":         ownedBy,
@@ -561,6 +561,17 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 			},
 		},
 	}
+	// Expose the real context capacity. Kiro publishes tokenLimits per model in
+	// ListAvailableModels; when known we advertise it verbatim, otherwise fall
+	// back to the version heuristic. Clients that support gateway discovery can
+	// use context_window / max_context_length instead of guessing.
+	contextWindow := getContextWindowSize(id)
+	entry["context_window"] = contextWindow
+	entry["max_context_length"] = contextWindow
+	if lim, ok := lookupModelTokenLimit(id); ok && lim.MaxOutput > 0 {
+		entry["max_completion_tokens"] = lim.MaxOutput
+	}
+	return entry
 }
 
 // refreshModelsCache 从 Kiro API 拉取模型列表并缓存

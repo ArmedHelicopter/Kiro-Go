@@ -10,6 +10,7 @@ import (
 	"net/http"
 	neturl "net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -107,7 +108,52 @@ func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
+	// Record the official per-model token limits: Kiro exposes them in every
+	// ListAvailableModels response, and clients (as well as our own context
+	// accounting) must use these real values instead of guessed heuristics.
+	for _, m := range result.Models {
+		if m.TokenLimits != nil && m.TokenLimits.MaxInputTokens > 0 {
+			recordModelTokenLimit(m.ModelId, m.TokenLimits.MaxInputTokens, m.TokenLimits.MaxOutputTokens)
+		}
+	}
 	return result.Models, nil
+}
+
+// modelTokenLimit is the official capacity of an upstream model.
+type modelTokenLimit struct {
+	MaxInput  int
+	MaxOutput int
+}
+
+// modelTokenLimits maps normalized model ids (plain and thinking-suffixed) to
+// their official token limits, populated from ListAvailableModels.
+var modelTokenLimits sync.Map
+
+func recordModelTokenLimit(id string, maxIn, maxOut int) {
+	id = strings.ToLower(strings.TrimSpace(id))
+	if id == "" || maxIn <= 0 {
+		return
+	}
+	lim := modelTokenLimit{MaxInput: maxIn, MaxOutput: maxOut}
+	modelTokenLimits.Store(id, lim)
+	if suffix := strings.ToLower(strings.TrimSpace(config.GetThinkingConfig().Suffix)); suffix != "" {
+		modelTokenLimits.Store(id+suffix, lim)
+	}
+}
+
+// lookupModelTokenLimit returns the recorded official limit for a model id
+// (optionally thinking-suffixed), or false when unknown.
+func lookupModelTokenLimit(model string) (modelTokenLimit, bool) {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" {
+		return modelTokenLimit{}, false
+	}
+	if v, ok := modelTokenLimits.Load(m); ok {
+		if lim, ok := v.(modelTokenLimit); ok && lim.MaxInput > 0 {
+			return lim, true
+		}
+	}
+	return modelTokenLimit{}, false
 }
 
 // ResolveProfileArn returns the account profile ARN, fetching and caching it
