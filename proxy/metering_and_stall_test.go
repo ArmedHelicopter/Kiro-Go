@@ -19,7 +19,7 @@ func TestStallTimeoutReader_ActivelyInterruptsBlockedRead(t *testing.T) {
 	defer pw.Close()
 
 	idleTimeout := 50 * time.Millisecond
-	sr := newStallTimeoutReader(pr, pr, idleTimeout, "test/blocked")
+	sr := newStallTimeoutReader(pr, pr, idleTimeout, "test/blocked", nil)
 	defer sr.Close()
 
 	buf := make([]byte, 64)
@@ -54,7 +54,7 @@ func TestStallTimeoutReader_HealthyStreamDoesNotTimeout(t *testing.T) {
 	pr, pw := io.Pipe()
 
 	idleTimeout := 80 * time.Millisecond
-	sr := newStallTimeoutReader(pr, pr, idleTimeout, "test/steady")
+	sr := newStallTimeoutReader(pr, pr, idleTimeout, "test/steady", nil)
 	defer sr.Close()
 
 	go func() {
@@ -79,6 +79,46 @@ func TestStallTimeoutReader_HealthyStreamDoesNotTimeout(t *testing.T) {
 	}
 	if total != 20 {
 		t.Fatalf("expected 20 bytes, got %d", total)
+	}
+}
+
+// TestStallTimeoutReader_InFlightDoesNotAbort verifies that once in-flight output
+// has begun, the watchdog does not actively close the socket or return stall errors,
+// allowing long deep-thinking pauses to proceed unhindered.
+func TestStallTimeoutReader_InFlightDoesNotAbort(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	idleTimeout := 50 * time.Millisecond
+	isEmitted := true
+	sr := newStallTimeoutReader(pr, pr, idleTimeout, "test/inflight", func() bool { return isEmitted })
+	defer sr.Close()
+
+	buf := make([]byte, 64)
+	errCh := make(chan error, 1)
+
+	// Simulate slow upstream that pauses for 120ms (longer than 50ms watchdog)
+	go func() {
+		time.Sleep(120 * time.Millisecond)
+		_, _ = pw.Write([]byte("delayed-token"))
+	}()
+
+	go func() {
+		n, err := sr.Read(buf)
+		if err == nil && string(buf[:n]) == "delayed-token" {
+			errCh <- nil
+		} else {
+			errCh <- err
+		}
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("expected in-flight read to succeed without stall abort, got %v", err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatalf("timed out waiting for in-flight read")
 	}
 }
 

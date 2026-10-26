@@ -102,7 +102,7 @@ func GetClientForProxy(proxyURL string) *http.Client {
 		return cached.(*http.Client)
 	}
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
+		Timeout:   0, // Streaming client: no arbitrary total timeout; strictly bounded by request context
 		Transport: buildKiroTransport(proxyURL),
 	}
 	proxyClientCache.Store(proxyURL, client)
@@ -165,7 +165,7 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 // InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.
 func InitKiroHttpClient(proxyURL string) {
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
+		Timeout:   0, // Streaming client: no arbitrary total timeout; strictly bounded by request context
 		Transport: buildKiroTransport(proxyURL),
 	}
 	kiroHttpStore.Store(client)
@@ -494,7 +494,33 @@ endpointLoop:
 			}
 
 			stallLabel := accountEmailForLog(account) + "/" + ep.Name
-			emitted, err := parseEventStreamTracked(newStallTimeoutReader(resp.Body, resp.Body, kiroStreamIdleTimeout, stallLabel), callback)
+			var hasEmitted bool
+			emittedFunc := func() bool { return hasEmitted }
+			stallReader := newStallTimeoutReader(resp.Body, resp.Body, kiroStreamTTFBTimeout, stallLabel, emittedFunc)
+
+			// Wrap callback to dynamically mark stall reader as in-flight on first output
+			wrappedCallback := *callback
+			origOnText := wrappedCallback.OnText
+			wrappedCallback.OnText = func(text string, isReasoning bool) {
+				hasEmitted = true
+				stallReader.MarkInFlight()
+				if origOnText != nil {
+					origOnText(text, isReasoning)
+				}
+			}
+			origOnToolUse := wrappedCallback.OnToolUse
+			wrappedCallback.OnToolUse = func(toolUse KiroToolUse) {
+				hasEmitted = true
+				stallReader.MarkInFlight()
+				if origOnToolUse != nil {
+					origOnToolUse(toolUse)
+				}
+			}
+
+			emitted, err := parseEventStreamTracked(stallReader, &wrappedCallback)
+			if emitted {
+				hasEmitted = true
+			}
 			resp.Body.Close()
 			if err == nil {
 				return nil
@@ -1163,46 +1189,70 @@ func parseMeteringUsage(event map[string]interface{}) float64 {
 	return 0
 }
 
-// kiroStreamIdleTimeout bounds silence on the upstream event stream: a
-// connected-but-silent upstream used to hang clients for minutes until their
-// own timeout fired.
-const kiroStreamIdleTimeout = 90 * time.Second
+// kiroStreamTTFBTimeout bounds silence on the upstream event stream *before*
+// any semantic output has been emitted (TTFB stage). If an upstream endpoint
+// or account is completely silent for 180s without producing a single token,
+// it is safely aborted so that the proxy can retry on another endpoint/account
+// with zero downstream side effects.
+const kiroStreamTTFBTimeout = 180 * time.Second
 
-// stallTimeoutReader aborts reads with an error when no data arrives within
-// the idle window. If a read is blocked waiting for TCP packets from a stalled
-// upstream, the watchdog actively closes the underlying closer to interrupt it.
+// stallTimeoutReader enforces TTFB timeouts before any semantic events are emitted,
+// and transitions to passive gap observation once in-flight output has begun.
+// In the in-flight stage, active socket abort is disabled to allow complex
+// deep-thinking pauses without premature disconnection, leaving the true request
+// lifecycle strictly governed by the client's context and TCP keep-alive.
 type stallTimeoutReader struct {
-	r        io.Reader
-	closer   io.Closer
-	idle     time.Duration
-	label    string
-	bytes    int64
-	timer    *time.Timer
-	timedOut bool
-	closed   bool
-	mu       sync.Mutex
+	r         io.Reader
+	closer    io.Closer
+	idle      time.Duration
+	label     string
+	bytes     int64
+	timer     *time.Timer
+	timedOut  bool
+	closed    bool
+	inFlight  bool
+	isEmitted func() bool
+	mu        sync.Mutex
 }
 
-func newStallTimeoutReader(r io.Reader, closer io.Closer, idle time.Duration, label string) *stallTimeoutReader {
-	sr := &stallTimeoutReader{r: r, closer: closer, idle: idle, label: label}
+func newStallTimeoutReader(r io.Reader, closer io.Closer, idle time.Duration, label string, isEmitted func() bool) *stallTimeoutReader {
+	sr := &stallTimeoutReader{
+		r:         r,
+		closer:    closer,
+		idle:      idle,
+		label:     label,
+		isEmitted: isEmitted,
+	}
 	sr.timer = time.AfterFunc(idle, func() {
 		sr.mu.Lock()
 		if sr.closed {
 			sr.mu.Unlock()
 			return
 		}
+		// If semantic output has already started (in-flight), do not actively abort!
+		// Output stream is already committed to the client; let the client context govern.
+		if (sr.isEmitted != nil && sr.isEmitted()) || sr.inFlight {
+			n := sr.bytes
+			sr.mu.Unlock()
+			logger.Infof("[KiroAPI] in-flight stream pause: no data for %v after %d bytes (%s), waiting for upstream thinking", idle, n, label)
+			return
+		}
 		sr.timedOut = true
 		n := sr.bytes
 		c := sr.closer
 		sr.mu.Unlock()
-		// Stall aborts used to be silent; without this line an intermittent
-		// upstream stall is indistinguishable from normal slowness.
-		logger.Warnf("[KiroAPI] upstream stall abort: no data for %v after %d bytes (%s)", idle, n, label)
+		logger.Warnf("[KiroAPI] upstream TTFB stall abort: no initial data for %v after %d bytes (%s)", idle, n, label)
 		if c != nil {
 			_ = c.Close()
 		}
 	})
 	return sr
+}
+
+func (sr *stallTimeoutReader) MarkInFlight() {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	sr.inFlight = true
 }
 
 func (sr *stallTimeoutReader) Read(p []byte) (int, error) {

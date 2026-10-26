@@ -924,11 +924,39 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	messageStarted := false
 	var messageStartUsage promptCacheUsage
 
+	// Mutex to protect concurrent SSE writes between response events and keep-alive heartbeats
+	var sseMu sync.Mutex
+
+	// Periodic keep-alive heartbeat to prevent client/gateway timeouts during long upstream thinking
+	heartbeatStop := make(chan struct{})
+	defer close(heartbeatStop)
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-heartbeatStop:
+				return
+			case <-ticker.C:
+				sseMu.Lock()
+				fmt.Fprint(w, ": keep-alive\n\n")
+				flusher.Flush()
+				sseMu.Unlock()
+			}
+		}
+	}()
+
+	sendSSE := func(event string, data interface{}) {
+		h.sendSSE(w, flusher, event, data, &sseMu)
+	}
+
 	ensureMessageStart := func() {
 		if messageStarted {
 			return
 		}
-		h.sendSSE(w, flusher, "message_start", map[string]interface{}{
+		sendSSE("message_start", map[string]interface{}{
 			"type": "message_start",
 			"message": map[string]interface{}{
 				"id":            msgID,
@@ -973,7 +1001,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			if activeBlockIndex < 0 {
 				return
 			}
-			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+			sendSSE("content_block_stop", map[string]interface{}{
 				"type":  "content_block_stop",
 				"index": activeBlockIndex,
 			})
@@ -992,7 +1020,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			nextContentIndex++
 
 			if blockType == "thinking" {
-				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				sendSSE("content_block_start", map[string]interface{}{
 					"type":  "content_block_start",
 					"index": idx,
 					"content_block": map[string]string{
@@ -1001,7 +1029,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 					},
 				})
 			} else {
-				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				sendSSE("content_block_start", map[string]interface{}{
 					"type":  "content_block_start",
 					"index": idx,
 					"content_block": map[string]string{
@@ -1028,7 +1056,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 					return
 				}
 				startContentBlock("text")
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				sendSSE("content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
 					"index": activeBlockIndex,
 					"delta": map[string]string{"type": "text_delta", "text": text},
@@ -1055,7 +1083,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 					return
 				}
 				startContentBlock("text")
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				sendSSE("content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
 					"index": activeBlockIndex,
 					"delta": map[string]string{"type": "text_delta", "text": outputText},
@@ -1065,7 +1093,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 					return
 				}
 				startContentBlock("text")
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				sendSSE("content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
 					"index": activeBlockIndex,
 					"delta": map[string]string{"type": "text_delta", "text": text},
@@ -1092,7 +1120,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				}
 				if text != "" {
 					startContentBlock("thinking")
-					h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					sendSSE("content_block_delta", map[string]interface{}{
 						"type":  "content_block_delta",
 						"index": activeBlockIndex,
 						"delta": map[string]string{"type": "thinking_delta", "thinking": text},
@@ -1236,7 +1264,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				idx := nextContentIndex
 				nextContentIndex++
 
-				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				sendSSE("content_block_start", map[string]interface{}{
 					"type":  "content_block_start",
 					"index": idx,
 					"content_block": map[string]interface{}{
@@ -1248,7 +1276,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				})
 
 				inputJSON, _ := json.Marshal(tu.Input)
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				sendSSE("content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
 					"index": idx,
 					"delta": map[string]interface{}{
@@ -1257,7 +1285,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 					},
 				})
 
-				h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+				sendSSE("content_block_stop", map[string]interface{}{
 					"type":  "content_block_stop",
 					"index": idx,
 				})
@@ -1312,14 +1340,16 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			}
 			lastErr = err
 			excluded[account.ID] = true
-			if !isStreamIntegrityError(err) {
+			// In-flight pauses or network hiccups after emission should not punish account health;
+			// only pre-emission transport/auth errors should mark an account unhealthy.
+			if !isStreamIntegrityError(err) && !messageStarted {
 				h.handleAccountFailure(account, err)
 			}
 			if !messageStarted {
 				continue
 			}
 			h.recordFailureWithDetails("claude", model, account.ID, err)
-			h.sendSSE(w, flusher, "error", map[string]interface{}{
+			sendSSE("error", map[string]interface{}{
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": err.Error()},
 			})
@@ -1356,7 +1386,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		stopReason := mapClaudeStopReason(upstreamStopReason, len(toolUses))
 
 		ensureMessageStart()
-		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
+		sendSSE("message_delta", map[string]interface{}{
 			"type": "message_delta",
 			"delta": map[string]interface{}{
 				"stop_reason": stopReason,
@@ -1364,7 +1394,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
 		})
 
-		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
+		sendSSE("message_stop", map[string]interface{}{
 			"type": "message_stop",
 		})
 		return
@@ -1379,7 +1409,11 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
-func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {
+func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}, mu ...*sync.Mutex) {
+	if len(mu) > 0 && mu[0] != nil {
+		mu[0].Lock()
+		defer mu[0].Unlock()
+	}
 	jsonData, _ := json.Marshal(data)
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, string(jsonData))
 	flusher.Flush()
