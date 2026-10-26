@@ -927,10 +927,13 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	// Mutex to protect concurrent SSE writes between response events and keep-alive heartbeats
 	var sseMu sync.Mutex
 
-	// Periodic keep-alive heartbeat to prevent client/gateway timeouts during long upstream thinking
+	// Periodic keep-alive heartbeat to prevent client/gateway timeouts during long upstream thinking.
+	// Uses tryLock to prevent the heartbeat goroutine from ever blocking or stalling normal SSE writes.
 	heartbeatStop := make(chan struct{})
-	defer close(heartbeatStop)
+	var heartbeatWg sync.WaitGroup
+	heartbeatWg.Add(1)
 	go func() {
+		defer heartbeatWg.Done()
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -940,12 +943,20 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			case <-heartbeatStop:
 				return
 			case <-ticker.C:
-				sseMu.Lock()
-				fmt.Fprint(w, ": keep-alive\n\n")
-				flusher.Flush()
-				sseMu.Unlock()
+				if ctx.Err() != nil {
+					return
+				}
+				if sseMu.TryLock() {
+					fmt.Fprint(w, ": keep-alive\n\n")
+					flusher.Flush()
+					sseMu.Unlock()
+				}
 			}
 		}
+	}()
+	defer func() {
+		close(heartbeatStop)
+		heartbeatWg.Wait()
 	}()
 
 	sendSSE := func(event string, data interface{}) {

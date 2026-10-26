@@ -19,7 +19,7 @@ func TestStallTimeoutReader_ActivelyInterruptsBlockedRead(t *testing.T) {
 	defer pw.Close()
 
 	idleTimeout := 50 * time.Millisecond
-	sr := newStallTimeoutReader(pr, pr, idleTimeout, "test/blocked", nil)
+	sr := newStallTimeoutReader(pr, pr, idleTimeout, "test/blocked")
 	defer sr.Close()
 
 	buf := make([]byte, 64)
@@ -54,7 +54,7 @@ func TestStallTimeoutReader_HealthyStreamDoesNotTimeout(t *testing.T) {
 	pr, pw := io.Pipe()
 
 	idleTimeout := 80 * time.Millisecond
-	sr := newStallTimeoutReader(pr, pr, idleTimeout, "test/steady", nil)
+	sr := newStallTimeoutReader(pr, pr, idleTimeout, "test/steady")
 	defer sr.Close()
 
 	go func() {
@@ -90,8 +90,8 @@ func TestStallTimeoutReader_InFlightDoesNotAbort(t *testing.T) {
 	defer pw.Close()
 
 	idleTimeout := 50 * time.Millisecond
-	isEmitted := true
-	sr := newStallTimeoutReader(pr, pr, idleTimeout, "test/inflight", func() bool { return isEmitted })
+	sr := newStallTimeoutReader(pr, pr, idleTimeout, "test/inflight")
+	sr.MarkInFlight()
 	defer sr.Close()
 
 	buf := make([]byte, 64)
@@ -122,7 +122,46 @@ func TestStallTimeoutReader_InFlightDoesNotAbort(t *testing.T) {
 	}
 }
 
-// TestParseMeteringUsage verifies robust extraction of usage across schema variants.
+// TestStallTimeoutReader_ConcurrentMarkInFlightTimer ensures there is no data race
+// when MarkInFlight, Read, and the watchdog timer fire concurrently.
+func TestStallTimeoutReader_ConcurrentMarkInFlightTimer(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	idleTimeout := 10 * time.Millisecond
+	sr := newStallTimeoutReader(pr, pr, idleTimeout, "test/race")
+	defer sr.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			sr.MarkInFlight()
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			_, _ = pw.Write([]byte("x"))
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 16)
+		for i := 0; i < 20; i++ {
+			_, _ = sr.Read(buf)
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	wg.Wait()
+}
 func TestParseMeteringUsage(t *testing.T) {
 	cases := []struct {
 		name  string
