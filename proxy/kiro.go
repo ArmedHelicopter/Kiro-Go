@@ -494,7 +494,7 @@ endpointLoop:
 			}
 
 			stallLabel := accountEmailForLog(account) + "/" + ep.Name
-			emitted, err := parseEventStreamTracked(newStallTimeoutReader(resp.Body, kiroStreamIdleTimeout, stallLabel), callback)
+			emitted, err := parseEventStreamTracked(newStallTimeoutReader(resp.Body, resp.Body, kiroStreamIdleTimeout, stallLabel), callback)
 			resp.Body.Close()
 			if err == nil {
 				return nil
@@ -584,6 +584,7 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	var totalCredits float64
 	var contextUsagePercentages []float64
 	var sawOutput bool
+	var sawMeteringEvent bool
 	var recordedStopReason string
 	pending := &pendingToolUses{}
 	trackedCallback := *callback
@@ -673,9 +674,9 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 				return emitted, toolErr
 			}
 		case "meteringEvent":
-			if usage, ok := event["usage"].(float64); ok {
-				totalCredits += usage
-			}
+			usage := parseMeteringUsage(event)
+			totalCredits += usage
+			sawMeteringEvent = true
 		case "contextUsageEvent":
 			if pct, ok := event["contextUsagePercentage"].(float64); ok {
 				contextUsagePercentages = append(contextUsagePercentages, pct)
@@ -698,9 +699,15 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	if !sawOutput {
 		return emitted, errEmptyKiroStream
 	}
-	if callback.OnCredits != nil && totalCredits > 0 {
+	if callback.OnCredits != nil && (totalCredits > 0 || sawMeteringEvent) {
 		callback.OnCredits(totalCredits)
-		if recordedStopReason == "" && callback.OnStopReason != nil {
+	}
+	// meteringEvent is the terminal billing event emitted by AWS Kiro on normal
+	// generation end. If metadataEvent was absent, and no pending tool calls remain,
+	// record end_turn so classifyStreamIntegrity recognizes the stream as complete.
+	if sawMeteringEvent && recordedStopReason == "" {
+		recordedStopReason = "end_turn"
+		if callback.OnStopReason != nil {
 			callback.OnStopReason("end_turn")
 		}
 	}
@@ -1131,34 +1138,69 @@ func parseEventStreamHeaders(data []byte) (map[string]string, error) {
 	return headers, nil
 }
 
+// parseMeteringUsage robustly extracts credit usage from meteringEvent across schema variants.
+func parseMeteringUsage(event map[string]interface{}) float64 {
+	for _, key := range []string{"usage", "totalCredits", "credits", "credit"} {
+		v, ok := event[key]
+		if !ok || v == nil {
+			continue
+		}
+		switch val := v.(type) {
+		case float64:
+			return val
+		case float32:
+			return float64(val)
+		case int:
+			return float64(val)
+		case int64:
+			return float64(val)
+		case json.Number:
+			if f, err := val.Float64(); err == nil {
+				return f
+			}
+		}
+	}
+	return 0
+}
+
 // kiroStreamIdleTimeout bounds silence on the upstream event stream: a
 // connected-but-silent upstream used to hang clients for minutes until their
 // own timeout fired.
 const kiroStreamIdleTimeout = 90 * time.Second
 
 // stallTimeoutReader aborts reads with an error when no data arrives within
-// the idle window. The watchdog re-arms on every successful read, so steadily
-// streaming responses are never interrupted - only true stalls are.
+// the idle window. If a read is blocked waiting for TCP packets from a stalled
+// upstream, the watchdog actively closes the underlying closer to interrupt it.
 type stallTimeoutReader struct {
 	r        io.Reader
+	closer   io.Closer
 	idle     time.Duration
 	label    string
 	bytes    int64
 	timer    *time.Timer
 	timedOut bool
+	closed   bool
 	mu       sync.Mutex
 }
 
-func newStallTimeoutReader(r io.Reader, idle time.Duration, label string) *stallTimeoutReader {
-	sr := &stallTimeoutReader{r: r, idle: idle, label: label}
+func newStallTimeoutReader(r io.Reader, closer io.Closer, idle time.Duration, label string) *stallTimeoutReader {
+	sr := &stallTimeoutReader{r: r, closer: closer, idle: idle, label: label}
 	sr.timer = time.AfterFunc(idle, func() {
 		sr.mu.Lock()
+		if sr.closed {
+			sr.mu.Unlock()
+			return
+		}
 		sr.timedOut = true
 		n := sr.bytes
+		c := sr.closer
 		sr.mu.Unlock()
 		// Stall aborts used to be silent; without this line an intermittent
 		// upstream stall is indistinguishable from normal slowness.
 		logger.Warnf("[KiroAPI] upstream stall abort: no data for %v after %d bytes (%s)", idle, n, label)
+		if c != nil {
+			_ = c.Close()
+		}
 	})
 	return sr
 }
@@ -1170,17 +1212,28 @@ func (sr *stallTimeoutReader) Read(p []byte) (int, error) {
 		return 0, fmt.Errorf("upstream stalled: no data for %v (%s)", sr.idle, sr.label)
 	}
 	sr.mu.Unlock()
+
 	n, err := sr.r.Read(p)
-	if n > 0 {
-		sr.mu.Lock()
+
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	if sr.timedOut {
+		return n, fmt.Errorf("upstream stalled: no data for %v (%s)", sr.idle, sr.label)
+	}
+	if n > 0 && !sr.closed {
 		sr.bytes += int64(n)
-		sr.mu.Unlock()
 		sr.timer.Reset(sr.idle)
 	}
 	return n, err
 }
 
 func (sr *stallTimeoutReader) Close() error {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	sr.closed = true
 	sr.timer.Stop()
+	if sr.closer != nil {
+		return sr.closer.Close()
+	}
 	return nil
 }
