@@ -210,7 +210,7 @@ const toolResultImagePlaceholder = "[Tool returned an image; the image is attach
 // message) and insert a placeholder note so the model knows context was elided.
 // The limit is kept conservatively below the observed upstream threshold to
 // leave room for headers and minor serialization overhead.
-const maxPayloadBytes = 480 * 1024
+const maxPayloadBytes = 900 * 1024
 
 // truncationPlaceholder is inserted in history where older turns were dropped to
 // fit within maxPayloadBytes.
