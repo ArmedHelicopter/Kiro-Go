@@ -118,7 +118,7 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 		return acc
 	}
 
-		// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
+	// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
 	var best *config.Account
 	var earliest time.Time
 	for i := range p.accounts {
@@ -268,6 +268,14 @@ func (p *AccountPool) GetByID(id string) *config.Account {
 }
 
 // RecordSuccess 记录请求成功，清除冷却
+// IsCoolingDown reports whether the account is currently inside a cooldown
+// window (quota errors cool down for an hour, repeated failures for a minute).
+func (p *AccountPool) IsCoolingDown(id string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cooldown, ok := p.cooldowns[id]
+	return ok && time.Now().Before(cooldown)
+}
 func (p *AccountPool) RecordSuccess(id string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

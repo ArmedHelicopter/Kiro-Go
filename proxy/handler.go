@@ -1497,7 +1497,7 @@ func (h *Handler) getAffinityAccount(affinityKey, model string, excluded map[str
 				id := b.accountID
 				if !excluded[id] {
 					acc := h.pool.GetByID(id)
-					if acc != nil && acc.Enabled {
+					if acc != nil && acc.Enabled && !h.pool.IsCoolingDown(id) {
 						logger.Debugf("[Affinity] Hit: key=%s → account=%s", shortAffinityKey(affinityKey), acc.Email)
 						return acc
 					}
