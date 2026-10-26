@@ -13,7 +13,7 @@ import (
 func TestStallTimeoutReaderAbortsSilentUpstream(t *testing.T) {
 	// A reader that never returns data and never returns EOF.
 	silent := &silentReader{}
-	sr := newStallTimeoutReader(silent, 150*time.Millisecond)
+	sr := newStallTimeoutReader(silent, 150*time.Millisecond, "test/stall")
 
 	// Mirror parseEventStream's io.ReadFull loop: keep reading until an error.
 	start := time.Now()
@@ -42,7 +42,7 @@ func TestStallTimeoutReaderAbortsSilentUpstream(t *testing.T) {
 // interrupted: slow-but-alive readers keep resetting the watchdog.
 func TestStallTimeoutReaderPassesDataAndRearms(t *testing.T) {
 	data := strings.Repeat("chunk;", 50) // 350 bytes delivered in small slices
-	sr := newStallTimeoutReader(strings.NewReader(data), 120*time.Millisecond)
+	sr := newStallTimeoutReader(strings.NewReader(data), 120*time.Millisecond, "test/steady")
 
 	var got strings.Builder
 	buf := make([]byte, 7) // small reads spaced by reader latency

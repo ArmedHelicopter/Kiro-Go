@@ -412,7 +412,11 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			continue
 		}
 
-		err = parseEventStream(newStallTimeoutReader(resp.Body, kiroStreamIdleTimeout), callback)
+		label := "<nil>/<nil>"
+		if account != nil {
+			label = account.Email + "/" + ep.Name
+		}
+		err = parseEventStream(newStallTimeoutReader(resp.Body, kiroStreamIdleTimeout, label), callback)
 		resp.Body.Close()
 		reqCancel()
 		return err
@@ -441,17 +445,23 @@ const kiroStreamIdleTimeout = 90 * time.Second
 type stallTimeoutReader struct {
 	r        io.Reader
 	idle     time.Duration
+	label    string
+	bytes    int64
 	timer    *time.Timer
 	timedOut bool
 	mu       sync.Mutex
 }
 
-func newStallTimeoutReader(r io.Reader, idle time.Duration) *stallTimeoutReader {
-	sr := &stallTimeoutReader{r: r, idle: idle}
+func newStallTimeoutReader(r io.Reader, idle time.Duration, label string) *stallTimeoutReader {
+	sr := &stallTimeoutReader{r: r, idle: idle, label: label}
 	sr.timer = time.AfterFunc(idle, func() {
 		sr.mu.Lock()
 		sr.timedOut = true
+		n := sr.bytes
 		sr.mu.Unlock()
+		// Stall aborts used to be silent; without this line an intermittent
+		// upstream stall is indistinguishable from normal slowness.
+		logger.Warnf("[KiroAPI] upstream stall abort: no data for %v after %d bytes (%s)", idle, n, label)
 		// Unblock a pending Read blocked inside the underlying body.
 		if c, ok := r.(io.Closer); ok {
 			_ = c.Close()
@@ -469,6 +479,9 @@ func (sr *stallTimeoutReader) Read(p []byte) (int, error) {
 	}
 	n, err := sr.r.Read(p)
 	if n > 0 {
+		sr.mu.Lock()
+		sr.bytes += int64(n)
+		sr.mu.Unlock()
 		sr.timer.Reset(sr.idle)
 	}
 	return n, err
