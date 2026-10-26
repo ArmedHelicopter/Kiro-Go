@@ -17,7 +17,8 @@ func TestClaudeToKiroTruncatesOversizedHistory(t *testing.T) {
 	msgs := []ClaudeMessage{
 		{Role: "user", Content: "start the long task"},
 	}
-	for i := 0; i < 800; i++ {
+	turns := maxPayloadBytes/(2*len(big)) + 100
+	for i := 0; i < turns; i++ {
 		msgs = append(msgs,
 			ClaudeMessage{Role: "assistant", Content: "step result: " + big},
 			ClaudeMessage{Role: "user", Content: "next: " + big},

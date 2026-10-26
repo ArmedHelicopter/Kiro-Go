@@ -138,18 +138,23 @@ func ResolveAccountProxyURL(account *config.Account) string {
 
 // buildKiroTransport constructs an HTTP Transport with optional outbound proxy support.
 func buildKiroTransport(proxyURL string) *http.Transport {
+	// Long-lived event streams are fragile over HTTP/2 (especially via a
+	// CONNECT proxy) and over gzip: both can hold bytes back and look like
+	// an upstream stall. Force HTTP/1.1 + identity encoding, keep TCP alive.
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
 	t := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  false,
-		ForceAttemptHTTP2:   true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+		DisableCompression:    true,
+		ForceAttemptHTTP2:     false,
+		DialContext:           dialer.DialContext,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
 			t.Proxy = http.ProxyURL(u)
-			// Proxied connections cannot negotiate HTTP/2.
-			t.ForceAttemptHTTP2 = false
 		}
 	} else {
 		t.Proxy = http.ProxyFromEnvironment
@@ -488,7 +493,8 @@ endpointLoop:
 				continue endpointLoop
 			}
 
-			emitted, err := parseEventStreamTracked(resp.Body, callback)
+			stallLabel := accountEmailForLog(account) + "/" + ep.Name
+			emitted, err := parseEventStreamTracked(newStallTimeoutReader(resp.Body, kiroStreamIdleTimeout, stallLabel), callback)
 			resp.Body.Close()
 			if err == nil {
 				return nil
@@ -578,6 +584,7 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	var totalCredits float64
 	var contextUsagePercentages []float64
 	var sawOutput bool
+	var recordedStopReason string
 	pending := &pendingToolUses{}
 	trackedCallback := *callback
 	originalOnToolUse := trackedCallback.OnToolUse
@@ -678,6 +685,7 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 			// standalone stop reason event type. Its absence after content is
 			// how callers detect a truncated stream.
 			if reason := firstStringField(event, "stopReason", "stop_reason"); reason != "" && callback.OnStopReason != nil {
+				recordedStopReason = reason
 				callback.OnStopReason(reason)
 			}
 		}
@@ -692,6 +700,9 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	}
 	if callback.OnCredits != nil && totalCredits > 0 {
 		callback.OnCredits(totalCredits)
+		if recordedStopReason == "" && callback.OnStopReason != nil {
+			callback.OnStopReason("end_turn")
+		}
 	}
 	if callback.OnContextUsage != nil {
 		for _, percentage := range contextUsagePercentages {
@@ -1118,4 +1129,58 @@ func parseEventStreamHeaders(data []byte) (map[string]string, error) {
 		offset += valueLength
 	}
 	return headers, nil
+}
+
+// kiroStreamIdleTimeout bounds silence on the upstream event stream: a
+// connected-but-silent upstream used to hang clients for minutes until their
+// own timeout fired.
+const kiroStreamIdleTimeout = 90 * time.Second
+
+// stallTimeoutReader aborts reads with an error when no data arrives within
+// the idle window. The watchdog re-arms on every successful read, so steadily
+// streaming responses are never interrupted - only true stalls are.
+type stallTimeoutReader struct {
+	r        io.Reader
+	idle     time.Duration
+	label    string
+	bytes    int64
+	timer    *time.Timer
+	timedOut bool
+	mu       sync.Mutex
+}
+
+func newStallTimeoutReader(r io.Reader, idle time.Duration, label string) *stallTimeoutReader {
+	sr := &stallTimeoutReader{r: r, idle: idle, label: label}
+	sr.timer = time.AfterFunc(idle, func() {
+		sr.mu.Lock()
+		sr.timedOut = true
+		n := sr.bytes
+		sr.mu.Unlock()
+		// Stall aborts used to be silent; without this line an intermittent
+		// upstream stall is indistinguishable from normal slowness.
+		logger.Warnf("[KiroAPI] upstream stall abort: no data for %v after %d bytes (%s)", idle, n, label)
+	})
+	return sr
+}
+
+func (sr *stallTimeoutReader) Read(p []byte) (int, error) {
+	sr.mu.Lock()
+	if sr.timedOut {
+		sr.mu.Unlock()
+		return 0, fmt.Errorf("upstream stalled: no data for %v (%s)", sr.idle, sr.label)
+	}
+	sr.mu.Unlock()
+	n, err := sr.r.Read(p)
+	if n > 0 {
+		sr.mu.Lock()
+		sr.bytes += int64(n)
+		sr.mu.Unlock()
+		sr.timer.Reset(sr.idle)
+	}
+	return n, err
+}
+
+func (sr *stallTimeoutReader) Close() error {
+	sr.timer.Stop()
+	return nil
 }
